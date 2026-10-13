@@ -289,11 +289,21 @@ def main() -> int:
         return 2
 
     schedule = CronSchedule(settings.schedule)
+    LOG.info(
+        "Backup service started for %s@%s; schedule: %s; startup backup: %s",
+        settings.repository,
+        settings.branch,
+        settings.schedule,
+        "enabled" if settings.run_on_startup else "disabled",
+    )
     if settings.run_on_startup:
+        LOG.info("Running startup backup")
         try:
             sync(settings)
         except (GitHubError, OSError) as error:
             LOG.error("Initial backup failed: %s", error)
+    else:
+        LOG.info("Startup backup disabled; waiting for the next scheduled backup")
 
     last_run_minute: tuple[int, int, int, int, int] | None = None
     while True:

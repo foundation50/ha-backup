@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "rootfs/usr/bin/github-backup"
@@ -122,6 +123,41 @@ class SettingsTests(unittest.TestCase):
                 del os.environ["GITHUB_TOKEN"]
             else:
                 os.environ["GITHUB_TOKEN"] = previous_token
+
+
+class MainTests(unittest.TestCase):
+    def test_logs_when_startup_backup_is_disabled(self) -> None:
+        settings = backup.Settings(
+            repository="owner/repository",
+            branch="main",
+            schedule="0 0 1 1 *",
+            sources=(),
+            backup_path="backup",
+            run_on_startup=False,
+            token="token",
+        )
+
+        with (
+            mock.patch.object(backup, "read_settings", return_value=settings),
+            mock.patch.object(backup.time, "sleep", side_effect=KeyboardInterrupt),
+            self.assertLogs(backup.LOG, level="INFO") as logs,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                backup.main()
+
+        self.assertTrue(
+            any(
+                "Backup service started for owner/repository@main; schedule: 0 0 1 1 *; startup backup: disabled"
+                in message
+                for message in logs.output
+            )
+        )
+        self.assertTrue(
+            any(
+                "Startup backup disabled; waiting for the next scheduled backup" in message
+                for message in logs.output
+            )
+        )
 
 
 class SyncTests(unittest.TestCase):

@@ -1,5 +1,5 @@
 name: GitHub Backup
-version: "1.0.0"
+version: "1.0.1"
 slug: github_backup
 description: Sync selected Home Assistant files and directories to a GitHub repository.
 arch:
