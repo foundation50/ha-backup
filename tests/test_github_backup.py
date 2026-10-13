@@ -216,6 +216,40 @@ class SyncTests(unittest.TestCase):
                 ("PATCH", "/git/refs/heads/main", {"sha": "new-commit", "force": False}),
             )
 
+    def test_logs_sync_progress(self) -> None:
+        settings = backup.Settings(
+            repository="owner/repository",
+            branch="main",
+            schedule="0 3 * * *",
+            sources=(),
+            backup_path="backup",
+            run_on_startup=True,
+            token="token",
+        )
+
+        with (
+            mock.patch.object(backup, "collect_files", return_value={}),
+            mock.patch.object(backup, "GitHubClient") as client_class,
+            self.assertLogs(backup.LOG, level="INFO") as logs,
+        ):
+            client_class.return_value.request.side_effect = [
+                {"object": {"sha": "old-commit"}},
+                {"tree": {"sha": "old-tree"}},
+                {"tree": []},
+                {"sha": "manifest-blob"},
+                {"sha": "new-tree"},
+                {"sha": "new-commit"},
+                {},
+            ]
+            backup.sync(settings)
+
+        self.assertTrue(
+            any("Collected 0 file(s); reading main branch" in message for message in logs.output)
+        )
+        self.assertTrue(
+            any("Creating the backup commit" in message for message in logs.output)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

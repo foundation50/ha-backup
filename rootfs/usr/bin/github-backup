@@ -187,15 +187,20 @@ def get_manifest(client: GitHubClient, tree_sha: str, settings: Settings) -> set
 
 def sync(settings: Settings) -> None:
     client = GitHubClient(settings.repository, settings.token)
+    LOG.info("Collecting files from %d whitelist path(s)", len(settings.sources))
     files = collect_files(settings)
+    LOG.info("Collected %d file(s); reading %s branch", len(files), settings.branch)
     ref = client.request("GET", f"/git/ref/heads/{settings.branch}")
     commit_sha = ref["object"]["sha"]
+    LOG.info("Reading the current backup manifest")
     commit = client.request("GET", f"/git/commits/{commit_sha}")
     previous_files = get_manifest(client, commit["tree"]["sha"], settings)
     manifest_path = f"{settings.backup_path}/{MANIFEST_NAME}"
 
     tree_entries: list[dict[str, Any]] = []
-    for path, file_path in files.items():
+    for index, (path, file_path) in enumerate(files.items(), start=1):
+        if index == 1 or index % 25 == 0:
+            LOG.info("Uploading backup file %d of %d", index, len(files))
         blob = client.request(
             "POST",
             "/git/blobs",
@@ -203,6 +208,7 @@ def sync(settings: Settings) -> None:
         )
         tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
 
+    LOG.info("Creating the backup commit")
     manifest_contents = json.dumps(sorted(files), indent=2) + "\n"
     manifest_blob = client.request(
         "POST",
