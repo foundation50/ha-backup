@@ -63,6 +63,36 @@ class FileCollectionTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_rejects_non_string_option_token(self) -> None:
+        original_options_path = backup.OPTIONS_PATH
+        original_allowed_roots = backup.ALLOWED_ROOTS
+        previous_token = os.environ.pop("GITHUB_TOKEN", None)
+        try:
+            with tempfile.TemporaryDirectory() as temporary_directory:
+                options_path = Path(temporary_directory) / "options.json"
+                source = Path(temporary_directory) / "config.yaml"
+                source.write_text("homeassistant: {}\n")
+                backup.ALLOWED_ROOTS = (source.parent.resolve(),)
+                options_path.write_text(
+                    (
+                        '{"repository":"owner/repository","branch":"main",'
+                        '"schedule":"0 3 * * *","whitelist":["'
+                        + str(source)
+                        + '"],"backup_path":"backup","github_token":null}'
+                    )
+                )
+                backup.OPTIONS_PATH = options_path
+
+                with self.assertRaisesRegex(
+                    backup.ConfigurationError, "github_token must be a string"
+                ):
+                    backup.read_settings()
+        finally:
+            backup.OPTIONS_PATH = original_options_path
+            backup.ALLOWED_ROOTS = original_allowed_roots
+            if previous_token is not None:
+                os.environ["GITHUB_TOKEN"] = previous_token
+
     def test_environment_token_takes_precedence(self) -> None:
         previous_token = os.environ.get("GITHUB_TOKEN")
         os.environ["GITHUB_TOKEN"] = "environment-token"

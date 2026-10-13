@@ -86,7 +86,14 @@ def read_settings() -> Settings:
         raise ConfigurationError(f"Unable to read {OPTIONS_PATH}: {error}") from error
 
     repository = options.get("repository", "").strip()
-    token = os.environ.get("GITHUB_TOKEN", options.get("github_token", "")).strip()
+    environment_token = os.environ.get("GITHUB_TOKEN")
+    option_token = options.get("github_token", "")
+    if environment_token is not None:
+        token = environment_token.strip()
+    elif isinstance(option_token, str):
+        token = option_token.strip()
+    else:
+        raise ConfigurationError("github_token must be a string")
     branch = options.get("branch", "").strip()
     schedule = options.get("schedule", "").strip()
     backup_path = options.get("backup_path", "").strip("/")
@@ -298,7 +305,7 @@ def main() -> int:
                 sync(settings)
             except (GitHubError, OSError) as error:
                 LOG.error("Scheduled backup failed: %s", error)
-        time.sleep(1)
+        time.sleep(5)
 
 
 if __name__ == "__main__":
