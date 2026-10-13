@@ -14,6 +14,8 @@ atomic Git commit, so a backup never contains a partially updated set of files.
   whitelist or source directory.
 - Creates a manifest in the backup directory to precisely identify managed
   remote files.
+- Uses native Git commits and pushes; unchanged backups create no commit and
+  only changed content is transferred after the initial backup.
 
 ## Installation
 
@@ -86,6 +88,13 @@ The add-on writes `backup_path/.ha-github-backup-manifest.json`. Do not edit or
 delete that file manually: it identifies exactly which remote files the add-on
 may remove when they disappear locally. The add-on does not alter files outside
 `backup_path`.
+
+Each run fetches the configured branch into a temporary local worktree, applies
+the backup there, and stages only `backup_path`. If staged contents are
+unchanged, the add-on does not create a commit. Otherwise, it creates one commit
+and pushes it with Git's compressed pack protocol. A concurrent update to the
+same branch causes the push to fail rather than overwriting that update; the
+add-on reports the error and retries on its next scheduled run.
 
 To restore a file, retrieve it from a GitHub commit and copy it back to its
 original path under Home Assistant. After restoring configuration, validate it

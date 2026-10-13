@@ -1,6 +1,8 @@
 import importlib.machinery
 import importlib.util
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -161,9 +163,10 @@ class MainTests(unittest.TestCase):
 
 
 class SyncTests(unittest.TestCase):
-    def test_sync_creates_atomic_commit_and_removes_stale_manifest_files(self) -> None:
+    def test_apply_backup_files_removes_only_manifest_owned_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            source = Path(temporary_directory) / "config.yaml"
+            root = Path(temporary_directory)
+            source = root / "config.yaml"
             source.write_text("new: value\n")
             settings = backup.Settings(
                 repository="owner/repository",
@@ -174,49 +177,26 @@ class SyncTests(unittest.TestCase):
                 run_on_startup=True,
                 token="token",
             )
-            calls = []
+            worktree = root / "worktree"
+            backup_root = worktree / "backup"
+            backup_root.mkdir(parents=True)
+            (backup_root / "removed.yaml").write_text("remove me\n")
+            (backup_root / "unmanaged.yaml").write_text("keep me\n")
+            (backup_root / backup.MANIFEST_NAME).write_text('["backup/removed.yaml"]\n')
 
-            class FakeClient:
-                def __init__(self, repository: str, token: str) -> None:
-                    self.repository = repository
-                    self.token = token
+            files = {"backup/config/config.yaml": source}
+            backup.apply_backup_files(settings, files, worktree)
 
-                def request(self, method: str, path: str, payload=None):
-                    calls.append((method, path, payload))
-                    responses = {
-                        ("GET", "/git/ref/heads/main"): {"object": {"sha": "old-commit"}},
-                        ("GET", "/git/commits/old-commit"): {"tree": {"sha": "old-tree"}},
-                        ("GET", "/git/trees/old-tree?recursive=1"): {
-                            "tree": [{"path": "backup/.ha-github-backup-manifest.json", "sha": "manifest"}]
-                        },
-                        ("GET", "/git/blobs/manifest"): {
-                            "content": "WyJiYWNrdXAvcmVtb3ZlZC55YW1sIl0="
-                        },
-                        ("POST", "/git/blobs"): {"sha": f"blob-{len(calls)}"},
-                        ("POST", "/git/trees"): {"sha": "new-tree"},
-                        ("POST", "/git/commits"): {"sha": "new-commit"},
-                        ("PATCH", "/git/refs/heads/main"): {},
-                    }
-                    return responses[(method, path)]
-
-            original_client = backup.GitHubClient
-            backup.GitHubClient = FakeClient
-            try:
-                backup.sync(settings)
-            finally:
-                backup.GitHubClient = original_client
-
-            tree_payload = next(payload for method, path, payload in calls if path == "/git/trees")
-            self.assertIn(
-                {"path": "backup/removed.yaml", "mode": "100644", "type": "blob", "sha": None},
-                tree_payload["tree"],
+            self.assertFalse((backup_root / "removed.yaml").exists())
+            self.assertTrue((backup_root / "unmanaged.yaml").exists())
+            self.assertEqual(
+                (worktree / "backup/config/config.yaml").read_text(), "new: value\n"
             )
             self.assertEqual(
-                calls[-1],
-                ("PATCH", "/git/refs/heads/main", {"sha": "new-commit", "force": False}),
+                json.loads((backup_root / backup.MANIFEST_NAME).read_text()), sorted(files)
             )
 
-    def test_logs_sync_progress(self) -> None:
+    def test_sync_commits_and_pushes_staged_changes(self) -> None:
         settings = backup.Settings(
             repository="owner/repository",
             branch="main",
@@ -226,29 +206,66 @@ class SyncTests(unittest.TestCase):
             run_on_startup=True,
             token="token",
         )
+        commands = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = mock.MagicMock()
+            manager.__enter__.return_value = temporary_directory
 
-        with (
-            mock.patch.object(backup, "collect_files", return_value={}),
-            mock.patch.object(backup, "GitHubClient") as client_class,
-            self.assertLogs(backup.LOG, level="INFO") as logs,
-        ):
-            client_class.return_value.request.side_effect = [
-                {"object": {"sha": "old-commit"}},
-                {"tree": {"sha": "old-tree"}},
-                {"tree": []},
-                {"sha": "manifest-blob"},
-                {"sha": "new-tree"},
-                {"sha": "new-commit"},
-                {},
-            ]
-            backup.sync(settings)
+            def fake_run_git(arguments, worktree, environment, check=True):
+                commands.append((arguments, worktree, environment, check))
+                return subprocess.CompletedProcess(
+                    arguments, 1 if arguments[0] == "diff" else 0
+                )
 
-        self.assertTrue(
-            any("Collected 0 file(s); reading main branch" in message for message in logs.output)
+            with (
+                mock.patch.object(backup, "collect_files", return_value={}),
+                mock.patch.object(backup.tempfile, "TemporaryDirectory", return_value=manager),
+                mock.patch.object(backup, "run_git", side_effect=fake_run_git),
+            ):
+                backup.sync(settings)
+
+        command_arguments = [command[0] for command in commands]
+        self.assertEqual(command_arguments[0], ["init"])
+        self.assertIn(
+            ["remote", "add", "origin", "https://github.com/owner/repository.git"],
+            command_arguments,
         )
-        self.assertTrue(
-            any("Creating the backup commit" in message for message in logs.output)
+        self.assertIn(["fetch", "--depth=1", "origin", "main"], command_arguments)
+        self.assertIn(["add", "--all", "--", "backup"], command_arguments)
+        self.assertTrue(any(arguments[0] == "commit" or "commit" in arguments for arguments in command_arguments))
+        self.assertIn(["push", "origin", "HEAD:refs/heads/main"], command_arguments)
+        self.assertTrue(all("token" not in " ".join(arguments) for arguments in command_arguments))
+
+    def test_sync_skips_commit_when_backup_is_current(self) -> None:
+        settings = backup.Settings(
+            repository="owner/repository",
+            branch="main",
+            schedule="0 3 * * *",
+            sources=(),
+            backup_path="backup",
+            run_on_startup=True,
+            token="token",
         )
+        commands = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            manager = mock.MagicMock()
+            manager.__enter__.return_value = temporary_directory
+
+            def fake_run_git(arguments, worktree, environment, check=True):
+                commands.append(arguments)
+                return subprocess.CompletedProcess(arguments, 0)
+
+            with (
+                mock.patch.object(backup, "collect_files", return_value={}),
+                mock.patch.object(backup.tempfile, "TemporaryDirectory", return_value=manager),
+                mock.patch.object(backup, "run_git", side_effect=fake_run_git),
+                self.assertLogs(backup.LOG, level="INFO") as logs,
+            ):
+                backup.sync(settings)
+
+        self.assertTrue(any("Backup is already current" in message for message in logs.output))
+        self.assertFalse(any("commit" in arguments for arguments in commands))
+        self.assertFalse(any(arguments[0] == "push" for arguments in commands))
 
 
 if __name__ == "__main__":
