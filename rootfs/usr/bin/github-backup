@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Scheduled, atomic backups of whitelisted Home Assistant paths to GitHub."""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+OPTIONS_PATH = Path("/data/options.json")
+ALLOWED_ROOTS = (Path("/config"), Path("/share"), Path("/ssl"), Path("/media"))
+MANIFEST_NAME = ".ha-github-backup-manifest.json"
+LOG = logging.getLogger("github-backup")
+
+
+class ConfigurationError(ValueError):
+    """Raised when add-on options are invalid."""
+
+
+class GitHubError(RuntimeError):
+    """Raised for an unsuccessful GitHub API request."""
+
+
+@dataclass(frozen=True)
+class Settings:
+    repository: str
+    branch: str
+    schedule: str
+    sources: tuple[Path, ...]
+    backup_path: str
+    run_on_startup: bool
+    token: str
+
+
+class GitHubClient:
+    def __init__(self, repository: str, token: str) -> None:
+        self.repository = repository
+        self.token = token
+        self.base_url = f"https://api.github.com/repos/{repository}"
+
+    def request(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> Any:
+        data = json.dumps(payload).encode() if payload is not None else None
+        request = Request(
+            f"{self.base_url}{path}",
+            data=data,
+            method=method,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": "ha-github-backup",
+                "X-GitHub-Api-Version": "2022-11-28",
+                **({"Content-Type": "application/json"} if data else {}),
+            },
+        )
+        try:
+            with urlopen(request, timeout=60) as response:
+                response_data = response.read()
+        except HTTPError as error:
+            detail = error.read().decode(errors="replace")
+            raise GitHubError(
+                f"GitHub API {method} {path} failed with HTTP {error.code}: {detail}"
+            ) from error
+        except URLError as error:
+            raise GitHubError(f"GitHub API {method} {path} failed: {error.reason}") from error
+
+        return json.loads(response_data) if response_data else None
+
+
+def read_settings() -> Settings:
+    try:
+        options = json.loads(OPTIONS_PATH.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise ConfigurationError(f"Unable to read {OPTIONS_PATH}: {error}") from error
+
+    repository = options.get("repository", "").strip()
+    token = os.environ.get("GITHUB_TOKEN", options.get("github_token", "")).strip()
+    branch = options.get("branch", "").strip()
+    schedule = options.get("schedule", "").strip()
+    backup_path = options.get("backup_path", "").strip("/")
+    raw_sources = options.get("whitelist", [])
+
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repository):
+        raise ConfigurationError("repository must be in the form OWNER/REPOSITORY")
+    if not token:
+        raise ConfigurationError("Set GITHUB_TOKEN or github_token")
+    if not branch:
+        raise ConfigurationError("branch must not be empty")
+    if not backup_path or any(part in (".", "..") for part in backup_path.split("/")):
+        raise ConfigurationError("backup_path must be a safe, non-empty relative path")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ConfigurationError("whitelist must contain at least one path")
+
+    validated_sources = sorted(
+        {validate_source_path(str(source)) for source in raw_sources},
+        key=lambda path: len(path.parts),
+    )
+    sources = tuple(
+        source
+        for source in validated_sources
+        if not any(source.is_relative_to(parent) for parent in validated_sources if parent != source)
+    )
+    CronSchedule(schedule)
+    return Settings(
+        repository=repository,
+        branch=branch,
+        schedule=schedule,
+        sources=sources,
+        backup_path=backup_path,
+        run_on_startup=bool(options.get("run_on_startup", True)),
+        token=token,
+    )
+
+
+def validate_source_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        raise ConfigurationError(f"Whitelist path must be absolute: {raw_path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ConfigurationError(f"Whitelist path cannot be resolved: {raw_path}") from error
+    if not any(resolved.is_relative_to(root) for root in ALLOWED_ROOTS):
+        roots = ", ".join(str(root) for root in ALLOWED_ROOTS)
+        raise ConfigurationError(f"Whitelist path must be below one of: {roots}: {raw_path}")
+    return resolved
+
+
+def remote_path(settings: Settings, source: Path, child: Path | None = None) -> str:
+    relative = source.relative_to("/")
+    if child is not None:
+        relative = relative / child.relative_to(source)
+    return f"{settings.backup_path}/{relative.as_posix()}"
+
+
+def collect_files(settings: Settings) -> dict[str, Path]:
+    files: dict[str, Path] = {}
+    for source in settings.sources:
+        if source.is_file():
+            files[remote_path(settings, source)] = source
+            continue
+        for child in sorted(source.rglob("*")):
+            if child.is_symlink():
+                LOG.warning("Skipping symlink: %s", child)
+            elif child.is_file():
+                files[remote_path(settings, source, child)] = child
+    return files
+
+
+def get_manifest(client: GitHubClient, tree_sha: str, settings: Settings) -> set[str]:
+    tree = client.request("GET", f"/git/trees/{tree_sha}?recursive=1")
+    manifest_path = f"{settings.backup_path}/{MANIFEST_NAME}"
+    manifest_entry = next(
+        (entry for entry in tree.get("tree", []) if entry["path"] == manifest_path), None
+    )
+    if manifest_entry is None:
+        return set()
+    blob = client.request("GET", f"/git/blobs/{manifest_entry['sha']}")
+    try:
+        contents = base64.b64decode(blob["content"]).decode()
+        manifest = json.loads(contents)
+    except (KeyError, ValueError, UnicodeDecodeError) as error:
+        raise GitHubError(f"Existing backup manifest is invalid: {error}") from error
+    if not isinstance(manifest, list) or not all(isinstance(path, str) for path in manifest):
+        raise GitHubError("Existing backup manifest must contain a list of file paths")
+    return set(manifest)
+
+
+def sync(settings: Settings) -> None:
+    client = GitHubClient(settings.repository, settings.token)
+    files = collect_files(settings)
+    ref = client.request("GET", f"/git/ref/heads/{settings.branch}")
+    commit_sha = ref["object"]["sha"]
+    commit = client.request("GET", f"/git/commits/{commit_sha}")
+    previous_files = get_manifest(client, commit["tree"]["sha"], settings)
+    manifest_path = f"{settings.backup_path}/{MANIFEST_NAME}"
+
+    tree_entries: list[dict[str, Any]] = []
+    for path, file_path in files.items():
+        blob = client.request(
+            "POST",
+            "/git/blobs",
+            {"content": base64.b64encode(file_path.read_bytes()).decode(), "encoding": "base64"},
+        )
+        tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+
+    manifest_contents = json.dumps(sorted(files), indent=2) + "\n"
+    manifest_blob = client.request(
+        "POST",
+        "/git/blobs",
+        {"content": base64.b64encode(manifest_contents.encode()).decode(), "encoding": "base64"},
+    )
+    tree_entries.append(
+        {"path": manifest_path, "mode": "100644", "type": "blob", "sha": manifest_blob["sha"]}
+    )
+    for path in previous_files - set(files):
+        tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": None})
+
+    tree = client.request(
+        "POST", "/git/trees", {"base_tree": commit["tree"]["sha"], "tree": tree_entries}
+    )
+    new_commit = client.request(
+        "POST",
+        "/git/commits",
+        {
+            "message": f"Home Assistant backup: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+            "tree": tree["sha"],
+            "parents": [commit_sha],
+        },
+    )
+    client.request(
+        "PATCH",
+        f"/git/refs/heads/{settings.branch}",
+        {"sha": new_commit["sha"], "force": False},
+    )
+    LOG.info("Synced %d file(s) to %s@%s", len(files), settings.repository, settings.branch)
+
+
+class CronSchedule:
+    def __init__(self, expression: str) -> None:
+        fields = expression.split()
+        if len(fields) != 5:
+            raise ConfigurationError("schedule must be a five-field cron expression")
+        limits = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
+        self.values = tuple(
+            self._parse_field(field, low, high) for field, (low, high) in zip(fields, limits)
+        )
+        self.day_of_month_wildcard = fields[2] == "*"
+        self.day_of_week_wildcard = fields[4] == "*"
+
+    @staticmethod
+    def _parse_field(field: str, low: int, high: int) -> set[int]:
+        values: set[int] = set()
+        for item in field.split(","):
+            match = re.fullmatch(r"(\*|\d+(?:-\d+)?)(?:/(\d+))?", item)
+            if match is None:
+                raise ConfigurationError(f"Invalid cron field: {field}")
+            span, step_text = match.groups()
+            step = int(step_text or "1")
+            if step < 1:
+                raise ConfigurationError(f"Cron step must be positive: {field}")
+            if span == "*":
+                start, end = low, high
+            elif "-" in span:
+                start, end = map(int, span.split("-"))
+            else:
+                start = end = int(span)
+            if start < low or end > high or start > end:
+                raise ConfigurationError(f"Cron value out of range: {field}")
+            values.update(range(start, end + 1, step))
+        return values
+
+    def matches(self, now: datetime) -> bool:
+        minute, hour, day, month, weekday = self.values
+        if now.minute not in minute or now.hour not in hour or now.month not in month:
+            return False
+        cron_weekday = (now.weekday() + 1) % 7
+        dom_match, dow_match = now.day in day, cron_weekday in weekday
+        if self.day_of_month_wildcard or self.day_of_week_wildcard:
+            return dom_match and dow_match
+        return dom_match or dow_match
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        settings = read_settings()
+    except ConfigurationError as error:
+        LOG.error("Invalid configuration: %s", error)
+        return 2
+
+    schedule = CronSchedule(settings.schedule)
+    if settings.run_on_startup:
+        try:
+            sync(settings)
+        except (GitHubError, OSError) as error:
+            LOG.error("Initial backup failed: %s", error)
+
+    last_run_minute: tuple[int, int, int, int, int] | None = None
+    while True:
+        now = datetime.now().astimezone()
+        minute_key = (now.year, now.month, now.day, now.hour, now.minute)
+        if minute_key != last_run_minute and schedule.matches(now):
+            last_run_minute = minute_key
+            try:
+                sync(settings)
+            except (GitHubError, OSError) as error:
+                LOG.error("Scheduled backup failed: %s", error)
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
